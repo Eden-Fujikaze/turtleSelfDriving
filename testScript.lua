@@ -4,28 +4,27 @@ local TARGET_NAME = "Eden_Fujikaze"
 local RANGE = 50
 local MIN_RANGE = 6
 local MIN_RANGE_RELEASE = 8
-local TURN_DEADZONE = 5
 local MOVE_EPS = 0.3
 
--- five redstone link faces, one per state
-local FACE_BRAKE     = "top"
-local FACE_REVERSE   = "bottom"   -- gearshift toggle, NOT a drive signal
-local FACE_LEFT_BOTH = "left"
-local FACE_RIGHT_BOTH= "right"
-local FACE_FRONT     = "back"
+-- redstone link faces
+local FACE_BRAKE      = "left"
+local FACE_REVERSE    = "right"   -- gearshift toggle (unused by this simplified logic, kept for future)
+local FACE_LEFT_BOTH  = "top"
+local FACE_RIGHT_BOTH = "bottom"
+local FACE_FRONT      = "front"
 
-local REVERSE_ENTER = 100
-local FORWARD_ENTER = 80
-local MODE_SWITCH_COOLDOWN = 2.0
+-- turning vs driving hysteresis: wide gap so it doesn't flicker at the edge
+local ENTER_TURN = 15   -- if facing error exceeds this while driving straight, start turning
+local EXIT_TURN  = 5    -- once turning, must get within this to switch to driving straight
+
 local TICK = 0.25
 
 if not detector then error("no detector") end
 
 local lastX, lastZ = nil, nil
 local heading = 0
-local drivingReverse = false   -- gearshift state (persists until toggled again)
-local timeSinceSwitch = 999
 local tooClose = false
+local state = "brake" -- "brake" | "turnLeft" | "turnRight" | "front"
 
 local function normAngle(a)
   a = a % 360
@@ -33,49 +32,26 @@ local function normAngle(a)
   return a
 end
 
--- clears all five faces, then the caller sets exactly the one(s) it wants
 local function clearAll()
   redstone.setOutput(FACE_BRAKE, false)
   redstone.setOutput(FACE_LEFT_BOTH, false)
   redstone.setOutput(FACE_RIGHT_BOTH, false)
   redstone.setOutput(FACE_FRONT, false)
-  -- FACE_REVERSE is NOT cleared here — it's a toggle, not a drive state
 end
 
--- gearshift is only pulsed when we actually need to flip it
-local function setGear(wantReverse)
-  if wantReverse ~= drivingReverse then
-    redstone.setOutput(FACE_REVERSE, true)
-    sleep(0.1) -- adjust to whatever pulse length your gearbox needs
-    redstone.setOutput(FACE_REVERSE, false)
-    drivingReverse = wantReverse
+local function setState(newState)
+  if newState == state then return end
+  state = newState
+  clearAll()
+  if state == "brake" then
+    redstone.setOutput(FACE_BRAKE, true)
+  elseif state == "turnLeft" then
+    redstone.setOutput(FACE_LEFT_BOTH, true)
+  elseif state == "turnRight" then
+    redstone.setOutput(FACE_RIGHT_BOTH, true)
+  elseif state == "front" then
+    redstone.setOutput(FACE_FRONT, true)
   end
-end
-
-local function driveBrake()
-  clearAll()
-  redstone.setOutput(FACE_BRAKE, true)
-end
-
-local function driveFront()
-  clearAll()
-  redstone.setOutput(FACE_FRONT, true)
-end
-
-local function driveReverseStraight()
-  clearAll()
-  setGear(true)
-  redstone.setOutput(FACE_FRONT, true) -- same wheels engaged, gearbox is what flips direction
-end
-
-local function turnLeftInPlace()
-  clearAll()
-  redstone.setOutput(FACE_LEFT_BOTH, true)
-end
-
-local function turnRightInPlace()
-  clearAll()
-  redstone.setOutput(FACE_RIGHT_BOTH, true)
 end
 
 while true do
@@ -84,15 +60,12 @@ while true do
   if not myX then
     print("GPS fix failed, skipping this cycle")
   else
+    -- heading estimate from GPS motion (only updates while actually moving,
+    -- i.e. in "front" state — turning in place won't move X/Z much)
     if lastX then
       local mdx, mdz = myX - lastX, myZ - lastZ
       if math.sqrt(mdx * mdx + mdz * mdz) > MOVE_EPS then
-        local raw = math.deg(math.atan2(mdz, mdx))
-        if drivingReverse then
-          heading = normAngle(raw + 180)
-        else
-          heading = normAngle(raw)
-        end
+        heading = normAngle(math.deg(math.atan2(mdz, mdx)))
       end
     end
     lastX, lastZ = myX, myZ
@@ -101,69 +74,41 @@ while true do
 
     if not ok or not playerPos then
       print("Could not get player position:", playerPos)
-      driveBrake()
+      setState("brake")
     else
       local dx = playerPos.x - myX
       local dz = playerPos.z - myZ
       local distance = math.sqrt(dx * dx + dz * dz)
 
       if tooClose then
-        if distance > MIN_RANGE_RELEASE then
-          tooClose = false
-        end
+        if distance > MIN_RANGE_RELEASE then tooClose = false end
       else
-        if distance < MIN_RANGE then
-          tooClose = true
-        end
+        if distance < MIN_RANGE then tooClose = true end
       end
 
       if distance > RANGE or tooClose then
-        driveBrake()
+        setState("brake")
       else
         local targetAngle = math.deg(math.atan2(dz, dx))
-        local fwdDiff = normAngle(targetAngle - heading)
+        local diff = normAngle(targetAngle - heading)
 
-        -- forward/reverse mode hysteresis, same cooldown gate as before
-        timeSinceSwitch = timeSinceSwitch + TICK
-        local wantReverse = drivingReverse
-        if timeSinceSwitch >= MODE_SWITCH_COOLDOWN then
-          if drivingReverse then
-            if math.abs(fwdDiff) < FORWARD_ENTER then
-              wantReverse = false
-              timeSinceSwitch = 0
-            end
+        print(string.format("dist=%.1f heading=%.1f diff=%.1f state=%s",
+          distance, heading, diff, state))
+
+        if state == "front" then
+          -- only break out of driving straight if it's drifted a real amount
+          if math.abs(diff) > ENTER_TURN then
+            setState(diff > 0 and "turnRight" or "turnLeft")
           else
-            if math.abs(fwdDiff) > REVERSE_ENTER then
-              wantReverse = true
-              timeSinceSwitch = 0
-            end
+            setState("front") -- no-op, keeps driving
           end
-        end
-
-        local angleDiff
-        if wantReverse then
-          angleDiff = normAngle(targetAngle - normAngle(heading + 180))
         else
-          angleDiff = fwdDiff
-        end
-
-        print(string.format("dist=%.1f heading=%.1f rev=%s diff=%.1f",
-          distance, heading, tostring(wantReverse), angleDiff))
-
-        -- decide state for this tick: in-place turn takes priority once
-        -- outside the deadzone, otherwise drive straight in current gear direction
-        if math.abs(angleDiff) < TURN_DEADZONE then
-          if wantReverse then
-            driveReverseStraight()
+          -- currently turning (or braked/starting) - keep turning until well-aligned
+          if math.abs(diff) < EXIT_TURN then
+            setState("front")
           else
-            driveFront()
+            setState(diff > 0 and "turnRight" or "turnLeft")
           end
-        elseif angleDiff > 0 then
-          setGear(false) -- in-place turns assume forward gear; adjust if your rig needs reverse gear too
-          turnRightInPlace()
-        else
-          setGear(false)
-          turnLeftInPlace()
         end
       end
     end
