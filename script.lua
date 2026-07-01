@@ -1,11 +1,11 @@
 local detector = peripheral.find("player_detector")
 
 local RANGE = 20
-local TARGETNAME = "EdenFujikaze"
+local TARGET_NAME = "EdenFujikaze"
 
 while true do
   local players = detector.getPlayersInRange(RANGE)
-  for , player in ipairs(players) do
+  for _, player in ipairs(players) do
     if player.Name == TARGET_NAME then
       local myX, myY, myZ = gps.locate()
 
